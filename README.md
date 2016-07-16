@@ -2,7 +2,7 @@
 
 *TL;DR: See `h --help`*
 
-*Also see [cheetsheet.md](./cheetsheet.md])*
+*Also see [cheetsheet.md](./cheatsheet.md)*
 
 -----
 
