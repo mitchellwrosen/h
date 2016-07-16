@@ -2,6 +2,7 @@
 {-# LANGUAGE MagicHash           #-}
 {-# LANGUAGE OverloadedLists     #-}
 {-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns        #-}
 
@@ -55,17 +56,28 @@ supportedTypeTransformation = \case
   TextListToText      f -> Blockwise (Text.lines . f)
   TextListToTextList  f -> Blockwise f
 
+-------------------------------------------------------------------------------
+-- main
+
+data Args = Args
+  { keep :: Bool
+  , func :: Text
+  }
+
+parseArgs :: Parser Args
+parseArgs = Args
+  <$> switch "keep" 'k' "Keep lines that throw exceptions"
+  <*> fmap Text.unwords (some (argText "function" "A Haskell function"))
 
 main :: IO ()
 main = do
-  s <- Text.unwords <$>
-         execParser
-           (info (helper <*> some (argText "function" "A Haskell function"))
-                 (headerDoc (Just helpText)))
+  Args{..} <-
+    execParser (info (helper <*> parseArgs)
+               (headerDoc (Just helpText)))
 
   let act :: IO (Maybe Transformation)
       act = fmap supportedTypeTransformation <$>
-              compileString (Text.unpack s)
+              compileString (Text.unpack func)
 
   try act >>= \case
     -- This is (probably) a GHC exception, just print it in all its ugly glory.
@@ -75,7 +87,7 @@ main = do
 
     Right Nothing -> do
       err (Text.unlines
-        [ "Could not compile \"" <> s <> "\" as any of the following types:"
+        [ "Could not compile `" <> func <> "` as any of the following types:"
         , ""
         , "  Text   -> Text"
         , "  Text   -> Bool"
@@ -99,12 +111,12 @@ main = do
     -- Linewise transformation: apply it to each line in stdin
     --
     -- Note: the simpler "stdout (fmap f stdin)" applies f strictly to each
-    -- line, but we want to translate exceptions to dropped lines rather than
-    -- die. This is useful for using partial functions strategically.
+    -- line, but we want to translate exceptions to dropped (or kept) lines
+    -- rather than die.
     Right (Just (Linewise f)) -> sh (do
       line <- stdin
       deepTry (f line) >>= \case
-        Left (_ :: SomeException) -> pure ()
+        Left (_ :: SomeException) -> when keep (echo line)
         Right ss -> mapM_ echo ss)
 
     -- Blockwise transformation: read all of stdin into memory, apply
@@ -144,6 +156,7 @@ main = do
     , "The function is compiled in the following context:"
     , ""
     , "  {-# LANGUAGE ExtendedDefaultRules #-}"
+    , "  {-# LANGUAGE MultiWayIf           #-}"
     , "  {-# LANGUAGE OverloadedStrings    #-}"
     , "  {-# LANGUAGE ScopedTypeVariables  #-}"
     , "  {-# LANGUAGE ViewPatterns         #-}"
@@ -189,6 +202,7 @@ compileString s =
                    , hscTarget = HscInterpreted
                    }
              `xopt_set`   Opt_ExtendedDefaultRules
+             `xopt_set`   Opt_MultiWayIf
              `xopt_set`   Opt_OverloadedStrings
              `xopt_set`   Opt_PartialTypeSignatures
              `xopt_set`   Opt_ScopedTypeVariables

@@ -89,10 +89,22 @@ $ ls | h '\x -> unpack x !! 10'
 m
 ```
 
+You can keep lines that throw partial functions by passing `--keep` or -`k`.
+
+```
+$ ls | h --keep '\x -> if | T.length x > 10 -> ()'
+()
+H.hs
+()
+README.md
+stack.yaml
+```
+
 ### What's in scope?
 
 ```haskell
   {-# LANGUAGE ExtendedDefaultRules #-}
+  {-# LANGUAGE MultiWayIf           #-}
   {-# LANGUAGE OverloadedStrings    #-}
   {-# LANGUAGE ScopedTypeVariables  #-}
   {-# LANGUAGE ViewPatterns         #-}
