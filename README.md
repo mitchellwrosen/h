@@ -2,6 +2,8 @@
 
 *TL;DR: See `h --help`*
 
+*Also see [cheetsheet.md](./cheetsheet.md])*
+
 -----
 
 `h` parses a Haskell function and applies it to stdin:
