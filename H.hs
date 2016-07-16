@@ -150,11 +150,11 @@ main = do
     , ""
     , "  import Data.Char"
     , "  import Data.Either"
-    , "  import Data.List hiding (lines, unlines, unwords, words)"
     , "  import Data.Maybe"
+    , "  import Data.List   hiding (lines, unlines, unwords, words)"
     , "  import Data.Monoid"
-    , "  import Data.Text (Text, lines, pack, unlines, unpack, unwords, words)"
-    , "  import Prelude hiding (lines, unlines, unwords, words)"
+    , "  import Data.Text   (Text, lines, pack, unlines, unpack, unwords, words)"
+    , "  import Prelude     hiding (lines, unlines, unwords, words)"
     , "  import Text.Printf"
     , "  import qualified Data.Text as T"
     , ""
@@ -198,8 +198,8 @@ compileString s =
     setContext
       [ importModule "Data.Char"
       , importModule "Data.Either"
-      , importModuleHiding "Data.List" ["lines", "unlines", "unwords", "words"]
       , importModule "Data.Maybe"
+      , importModuleHiding "Data.List" ["lines", "unlines", "unwords", "words"]
       , importModule "Data.Monoid"
       , importModule' "Data.Text" [] ["lines", "pack", "unlines", "unpack", "unwords", "words"]
       , importModule' "Data.Text.Internal" ["Text"] []
@@ -208,9 +208,8 @@ compileString s =
       , importModule "Text.Printf"
       ]
 
-    -- Compile once to cause an exception to be thrown on parse error. We want
-    -- to throw a different error message in this case.
-    _ <- compileExpr s
+    -- Parse the expression to throw a parse exception
+    _ <- exprType s
 
     -- We try compiling the string as each of the following things:
     --
@@ -285,43 +284,73 @@ compileString s =
                    "[Text] -> _")
           pure $! fromJust (TextListToText <$> fromDynamic d)
 
-    -- 7. A function from Read to a Text/[Text]. Here we force the function
-    -- to be linewise.
+    -- 7. A function from [Read] to a Text/[Text].
+    --
+    --     Read a => [a] -> Text
+    --     Read a => [a] -> [Text]
+
+    let attempt7 :: Ghc SupportedType
+        attempt7 = do
+          d <- dynCompileExpr ("(" ++ s ++ ") . map (read . unpack)")
+          pure $! head (catMaybes
+            [ TextListToText     <$> fromDynamic d
+            , TextListToTextList <$> fromDynamic d
+            ])
+
+    -- 8. A function from [Read] to [Show]
+    --
+    --     (Read a, Show b) => [a] -> [b]
+
+    let attempt8 :: Ghc SupportedType
+        attempt8 = do
+          d <- dynCompileExpr
+                 ("map (pack . show) . (" ++ s ++ ") . map (read . unpack)")
+          pure $! fromJust (TextListToTextList <$> fromDynamic d)
+
+    -- 9. A function from [Read] to Show
+    --
+    --     (Read a, Show b) => [a] -> b
+
+    let attempt9 :: Ghc SupportedType
+        attempt9 = do
+          d <- dynCompileExpr
+                 ("pack . show . (" ++ s ++ ") . map (read . unpack)")
+          pure $! fromJust (TextListToText <$> fromDynamic d)
+
+    -- 10. A function from Read to a Text/[Text].
     --
     --     Read a => a -> Text
     --     Read a => a -> [Text]
 
-    let attempt7 :: Ghc SupportedType
-        attempt7 = do
+    let attempt10 :: Ghc SupportedType
+        attempt10 = do
           d <- dynCompileExpr ("(" ++ s ++ ") . read . unpack")
           pure $! head (catMaybes
             [ TextToText     <$> fromDynamic d
             , TextToTextList <$> fromDynamic d
             ])
 
-    -- 8. A function from Read to [Show]. Here we force the function to be
-    -- linewise.
+    -- 11. A function from Read to [Show].
     --
     --     (Read a, Show b) => a -> [b]  (e.g. "\n -> [n+1,n+2]")
 
-    let attempt8 :: Ghc SupportedType
-        attempt8 = do
+    let attempt11 :: Ghc SupportedType
+        attempt11 = do
           d <- dynCompileExpr
                  ("map (pack . show) . (" ++ s ++ ") . read . unpack")
           pure $! fromJust (TextToTextList <$> fromDynamic d)
 
-    -- 9. A function from Read to Show. Here we force the function to be
-    -- linewise.
+    -- 12. A function from Read to Show.
     --
     --     (Read a, Show b) => a -> b  (e.g. "\n -> n+1")
 
-    let attempt9 :: Ghc SupportedType
-        attempt9 = do
+    let attempt12 :: Ghc SupportedType
+        attempt12 = do
           d <- dynCompileExpr ("pack . show . (" ++ s ++ ") . read . unpack")
           pure $! fromJust (TextToText <$> fromDynamic d)
 
-    gtryAll [ attempt1, attempt2, attempt3, attempt4,
-              attempt5, attempt6, attempt7, attempt8, attempt9 ]
+    gtryAll [ attempt1, attempt2, attempt3, attempt4, attempt5, attempt6,
+              attempt7, attempt8, attempt9, attempt10, attempt11, attempt12 ]
 
 ascribe :: String -> String -> String
 ascribe s typ = "(" ++ s ++ ") :: " ++ typ
