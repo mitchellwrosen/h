@@ -7,21 +7,18 @@
 
 module Main where
 
-import Control.DeepSeq     (force)
-import Control.Exception   (evaluate)
+import Control.DeepSeq     (NFData, force)
+import Control.Exception   (displayException, evaluate)
 import Data.Dynamic        (fromDynamic)
-import Data.Maybe          (catMaybes)
-import DynFlags            (ExtensionFlag(..), xopt_set)
+import Data.Maybe          (catMaybes, fromJust)
+import DynFlags            (ExtensionFlag(..), WarningFlag(..), wopt_unset, xopt_set)
 import Exception           (SomeException, gtry, try)
 import GHC
-import GhcMonad            (withSession)
 import GHC.Paths           (libdir)
-import GHC.Prim            (unsafeCoerce#)
-import HscMain             (hscStmt)
 import RdrName             (mkRdrUnqual)
 import OccName             (mkTcOcc, mkVarOcc)
 import Options.Applicative (execParser, headerDoc, helper, headerDoc, info)
-import Turtle              hiding (d, f, s, x)
+import Turtle              hiding (d, e, f, s, x)
 
 import qualified Data.Text                    as Text
 import qualified Control.Foldl                as Foldl
@@ -30,14 +27,12 @@ import qualified Text.PrettyPrint.ANSI.Leijen as Doc
 
 -- | A 'SupportedType' is the result of parsing the given string.
 data SupportedType
-  = TextToText           (Text   -> Text)
-  | TextToString         (Text   -> String)
-  | TextToTextList       (Text   -> [Text])
-  | TextToStringList     (Text   -> [String])
-  | TextListToText       ([Text] -> Text)
-  | TextListToString     ([Text] -> String)
-  | TextListToTextList   ([Text] -> [Text])
-  | TextListToStringList ([Text] -> [String])
+  = TextToText         (Text   -> Text)
+  | TextToBool         (Text   -> Bool)
+  | TextToChar         (Text   -> Char)
+  | TextToTextList     (Text   -> [Text])
+  | TextListToText     ([Text] -> Text)
+  | TextListToTextList ([Text] -> [Text])
 
 -- | A 'Transformation' sort of an alternate view of 'SupportedType', which
 -- categorizes each as a "linewise" or "blockwise" function.
@@ -53,14 +48,12 @@ data Transformation
 -- accordingly.
 supportedTypeTransformation :: SupportedType -> Transformation
 supportedTypeTransformation = \case
-  TextToText       f     -> Linewise  (Text.lines . f)
-  TextToString     f     -> Linewise  (Text.lines . Text.pack . f)
-  TextToTextList   f     -> Linewise  f
-  TextToStringList f     -> Linewise  (map Text.pack . f)
-  TextListToText   f     -> Blockwise (Text.lines . f)
-  TextListToString f     -> Blockwise (Text.lines . Text.pack . f)
-  TextListToTextList f   -> Blockwise f
-  TextListToStringList f -> Blockwise (map Text.pack . f)
+  TextToText          f -> Linewise  (Text.lines . f)
+  TextToBool          f -> Linewise  (\s -> if f s then [s] else [])
+  TextToChar          f -> Linewise  (pure . Text.singleton . f)
+  TextToTextList      f -> Linewise  f
+  TextListToText      f -> Blockwise (Text.lines . f)
+  TextListToTextList  f -> Blockwise f
 
 
 main :: IO ()
@@ -70,24 +63,36 @@ main = do
            (info (helper <*> some (argText "function" "A Haskell function"))
                  (headerDoc (Just helpText)))
 
-  let act :: IO Transformation
-      act = supportedTypeTransformation <$>
+  let act :: IO (Maybe Transformation)
+      act = fmap supportedTypeTransformation <$>
               compileString (Text.unpack s)
 
   try act >>= \case
-    -- Some ugly compiler error, don't bother printing it.
-    Left (_ :: SomeException) -> do
+    -- This is (probably) a GHC exception, just print it in all its ugly glory.
+    Left (e :: SomeException) -> do
+      err (Text.pack (displayException e))
+      exit (ExitFailure 1)
+
+    Right Nothing -> do
       err (Text.unlines
         [ "Could not compile \"" <> s <> "\" as any of the following types:"
         , ""
         , "  Text   -> Text"
-        , "  Text   -> String"
+        , "  Text   -> Bool"
+        , "  Text   -> Char"
         , "  Text   -> [Text]"
-        , "  Text   -> [String]"
         , "  [Text] -> Text"
-        , "  [Text] -> String"
         , "  [Text] -> [Text]"
-        , "  [Text] -> [String]"
+        , ""
+        , "  Show a => Text   -> a"
+        , "  Show a => Text   -> [a]"
+        , "  Show a => [Text] -> a"
+        , "  Show a => [Text] -> [a]"
+        , ""
+        , "  (Read a, Show b) => a -> b"
+        , "  (Read a, Show b) => a -> [b]"
+        , ""
+        , "If you think this is a bug, please submit it to https://github.com/mitchellwrosen/h/issues"
         ])
       exit (ExitFailure 1)
 
@@ -96,42 +101,61 @@ main = do
     -- Note: the simpler "stdout (fmap f stdin)" applies f strictly to each
     -- line, but we want to translate exceptions to dropped lines rather than
     -- die. This is useful for using partial functions strategically.
-    Right (Linewise f) -> sh (do
+    Right (Just (Linewise f)) -> sh (do
       line <- stdin
-      liftIO (try (evaluate (force (f line))) >>= \case
+      deepTry (f line) >>= \case
         Left (_ :: SomeException) -> pure ()
-        Right txts -> mapM_ echo txts))
+        Right ss -> mapM_ echo ss)
 
     -- Blockwise transformation: read all of stdin into memory, apply
     -- transformation, and stream it all out.
-    Right (Blockwise f) -> fold stdin Foldl.list >>= stdout . select . f
+    Right (Just (Blockwise f)) -> do
+      ss <- fold stdin Foldl.list
+      deepTry (f ss) >>= \case
+        Left (_ :: SomeException) -> pure ()
+        Right ss' -> stdout (select ss')
  where
   helpText :: Doc.Doc
   helpText = Doc.vcat
-    [ "Execute an arbitrary Haskell function on stdin and write the results to\
-      \ stdout."
+    [ "Execute an arbitrary Haskell function on stdin and write the results to"
+    , "stdout."
+    , ""
     , "The function must have one of the following types:"
     , ""
     , "  Text   -> Text"
-    , "  Text   -> String"
+    , "  Text   -> Bool"
+    , "  Text   -> Char"
     , "  Text   -> [Text]"
-    , "  Text   -> [String]"
     , "  [Text] -> Text"
-    , "  [Text] -> String"
     , "  [Text] -> [Text]"
-    , "  [Text] -> [String]"
+    , ""
+    , "  Show a => Text   -> a"
+    , "  Show a => Text   -> [a]"
+    , "  Show a => [Text] -> a"
+    , "  Show a => [Text] -> [a]"
+    , ""
+    , "  (Read a, Show b) => a -> b"
+    , "  (Read a, Show b) => a -> [b]"
+    , ""
+    , "Returning a list as output will print each element on a separate line;"
+    , "returning a boolean will filter out that Text if false;"
+    , "and accepting a list as input will apply the function to all of stdin."
     , ""
     , "The function is compiled in the following context:"
     , ""
     , "  {-# LANGUAGE ExtendedDefaultRules #-}"
     , "  {-# LANGUAGE OverloadedStrings    #-}"
+    , "  {-# LANGUAGE ScopedTypeVariables  #-}"
+    , "  {-# LANGUAGE ViewPatterns         #-}"
+    , ""
     , "  import Data.Char"
     , "  import Data.Either"
-    , "  import Data.List   hiding (lines, unlines, unwords, words)"
+    , "  import Data.List hiding (lines, unlines, unwords, words)"
     , "  import Data.Maybe"
     , "  import Data.Monoid"
-    , "  import Data.Text   (Text, lines, pack, unlines, unpack, unwords, words)"
-    , "  import Prelude     hiding (lines, unlines, unwords, words)"
+    , "  import Data.Text (Text, lines, pack, unlines, unpack, unwords, words)"
+    , "  import Prelude hiding (lines, unlines, unwords, words)"
+    , "  import Text.Printf"
     , "  import qualified Data.Text as T"
     , ""
     , "Example usage:"
@@ -145,20 +169,31 @@ main = do
     , "  H . h s"
     , "  p a c k a g e . y a m l"
     , "  s t a c k . y a m l"
+    , ""
+    , "  $ ls | h \"\\x -> T.length x > 10\""
+    , "  h-cli-tool.cabal"
+    , "  package.yaml"
     ]
 
--- | Compile a string to a 'SupportedType'. Throws a Ghc error if no supported
--- type could be successfully parsed.
-compileString :: String -> IO SupportedType
+  deepTry :: (NFData a, MonadIO m) => a -> m (Either SomeException a)
+  deepTry = liftIO . try . evaluate . force
+
+-- | Compile a string to a 'SupportedType'. Throws a Ghc exception on parse
+-- error, or returns Nothing if we couldn't figure out the type.
+compileString :: String -> IO (Maybe SupportedType)
 compileString s =
   runGhc (Just libdir) $ do
     dflags <- getSessionDynFlags
     _ <- setSessionDynFlags
-           (dflags
-             { ghcLink   = LinkInMemory
-             , hscTarget = HscInterpreted
-             } `xopt_set` Opt_ExtendedDefaultRules
-               `xopt_set` Opt_OverloadedStrings)
+           (dflags { ghcLink   = LinkInMemory
+                   , hscTarget = HscInterpreted
+                   }
+             `xopt_set`   Opt_ExtendedDefaultRules
+             `xopt_set`   Opt_OverloadedStrings
+             `xopt_set`   Opt_PartialTypeSignatures
+             `xopt_set`   Opt_ScopedTypeVariables
+             `xopt_set`   Opt_ViewPatterns
+             `wopt_unset` Opt_WarnPartialTypeSignatures)
 
     setContext
       [ importModule "Data.Char"
@@ -170,40 +205,123 @@ compileString s =
       , importModule' "Data.Text.Internal" ["Text"] []
       , importModuleQualified "Data.Text" "T"
       , importModuleHiding "Prelude" ["lines", "unlines", "unwords", "words"]
+      , importModule "Text.Printf"
       ]
 
-    -- The "fast path": compile to a Dynamic, then see if it matches any of the
-    -- supported types.
-    let fastPath :: Ghc SupportedType
-        fastPath = do
-          d <- dynCompileExpr s
-          case catMaybes
-                 [ TextToText           <$> fromDynamic d
-                 , TextToString         <$> fromDynamic d
-                 , TextToTextList       <$> fromDynamic d
-                 , TextToStringList     <$> fromDynamic d
-                 , TextListToText       <$> fromDynamic d
-                 , TextListToString     <$> fromDynamic d
-                 , TextListToTextList   <$> fromDynamic d
-                 , TextListToStringList <$> fromDynamic d
-                 ] of
-            -- Exception contents are totally ignored, it could be anything.
-            -- Just has to be forced here or sequenced so as to not escape the
-            -- enclosing 'try'.
-            []    -> liftIO (evaluate undefined)
-            (t:_) -> pure t
+    -- Compile once to cause an exception to be thrown on parse error. We want
+    -- to throw a different error message in this case.
+    _ <- compileExpr s
 
-    gtryAll
-      [ fastPath
-      -- Here, the fast path failed, so try ascribing each supported type's
-      -- type signature and recompile. Well, we don't need to try *every*
-      -- supported type, because not all of them have much room for
-      -- polymorphism. For example, what sort of useful function of type
-      -- "forall a. Text -> [a]" could one possibly write that requires an
-      -- explicit ":: Text -> String"?
-      , TextToText         <$> compileExpr' (ascribe s "Text -> Text")
-      , TextListToTextList <$> compileExpr' (ascribe s "[Text] -> [Text]")
-      ]
+    -- We try compiling the string as each of the following things:
+    --
+    -- 1. A function from Text to Text, Bool, Char, or [Text].
+
+    let attempt1 :: Ghc SupportedType
+        attempt1 = do
+          d <- dynCompileExpr (ascribe s "Text -> _")
+          pure $! head (catMaybes
+            [ TextToText     <$> fromDynamic d
+            , TextToBool     <$> fromDynamic d
+            , TextToChar     <$> fromDynamic d
+            , TextToTextList <$> fromDynamic d
+            ])
+
+    -- 2. A function from [Text] to Text or [Text].
+
+    let attempt2 :: Ghc SupportedType
+        attempt2 = do
+          d <- dynCompileExpr (ascribe s "[Text] -> _")
+          pure $! head (catMaybes
+            [ TextListToText     <$> fromDynamic d
+            , TextListToTextList <$> fromDynamic d
+            ])
+
+    -- 3. A function from Text to a [Show]. This comes before a Text to Show
+    -- because we want to output elements of lists on separate lines.
+    --
+    --     Show a => Text -> [a]  (e.g. "map ord . unpack")
+
+    let attempt3 :: Ghc SupportedType
+        attempt3 = do
+          d <- dynCompileExpr
+                 (ascribe
+                   ("map (pack . show) . (" ++ s ++ ")")
+                   "Text -> _")
+          pure $! fromJust (TextToTextList <$> fromDynamic d)
+
+    -- 4. A function from Text to a Show.
+    --
+    --     Show a => Text -> a  (e.g. "T.length")
+
+    let attempt4 :: Ghc SupportedType
+        attempt4 = do
+          d <- dynCompileExpr
+                 (ascribe
+                   ("pack . show . (" ++ s ++ ")")
+                   "Text -> _")
+          pure $! fromJust (TextToText <$> fromDynamic d)
+
+    -- 5. A function from [Text] to a [Show]. This comes before a [Text] to
+    --
+    --     Show a => [Text] -> [a]  (e.g. "replicate 2 . length")
+
+    let attempt5 :: Ghc SupportedType
+        attempt5 = do
+          d <- dynCompileExpr
+                 (ascribe
+                   ("map (pack . show) . (" ++ s ++ ")")
+                   "[Text] -> _")
+          pure $! fromJust (TextListToTextList <$> fromDynamic d)
+
+    -- 6. A function from [Text] to a Show.
+    --
+    --     Show a => [Text] -> a  (e.g. "length")
+
+    let attempt6 :: Ghc SupportedType
+        attempt6 = do
+          d <- dynCompileExpr
+                 (ascribe
+                   ("pack . show . (" ++ s ++ ")")
+                   "[Text] -> _")
+          pure $! fromJust (TextListToText <$> fromDynamic d)
+
+    -- 7. A function from Read to a Text/[Text]. Here we force the function
+    -- to be linewise.
+    --
+    --     Read a => a -> Text
+    --     Read a => a -> [Text]
+
+    let attempt7 :: Ghc SupportedType
+        attempt7 = do
+          d <- dynCompileExpr ("(" ++ s ++ ") . read . unpack")
+          pure $! head (catMaybes
+            [ TextToText     <$> fromDynamic d
+            , TextToTextList <$> fromDynamic d
+            ])
+
+    -- 8. A function from Read to [Show]. Here we force the function to be
+    -- linewise.
+    --
+    --     (Read a, Show b) => a -> [b]  (e.g. "\n -> [n+1,n+2]")
+
+    let attempt8 :: Ghc SupportedType
+        attempt8 = do
+          d <- dynCompileExpr
+                 ("map (pack . show) . (" ++ s ++ ") . read . unpack")
+          pure $! fromJust (TextToTextList <$> fromDynamic d)
+
+    -- 9. A function from Read to Show. Here we force the function to be
+    -- linewise.
+    --
+    --     (Read a, Show b) => a -> b  (e.g. "\n -> n+1")
+
+    let attempt9 :: Ghc SupportedType
+        attempt9 = do
+          d <- dynCompileExpr ("pack . show . (" ++ s ++ ") . read . unpack")
+          pure $! fromJust (TextToText <$> fromDynamic d)
+
+    gtryAll [ attempt1, attempt2, attempt3, attempt4,
+              attempt5, attempt6, attempt7, attempt8, attempt9 ]
 
 ascribe :: String -> String -> String
 ascribe s typ = "(" ++ s ++ ") :: " ++ typ
@@ -276,23 +394,10 @@ importTypeConstructor = noLoc . IEVar . noLoc . mkRdrUnqual . mkTcOcc
 importVar :: String -> LIE RdrName
 importVar = noLoc . IEVar . noLoc . mkRdrUnqual . mkVarOcc
 
--- | Like 'compileExpr', but we don't bother updating the fixity env because
--- we aren't defining any fixities. Caller is responsible for requesting the
--- right type from this function (it calls unsafeCoerce).
-compileExpr' :: String -> Ghc a
-compileExpr' s =
-  withSession (\session -> liftIO (do
-    Just ([_], hvals, _) <-
-      hscStmt session ("let __h_compile_expr = " ++ s)
-    [hval] <- hvals
-    pure (unsafeCoerce# hval)))
-
--- | Try each action in turn, returning the first one to succeed (or the last
--- one in the list). List must be non-empty.
-gtryAll :: [Ghc a] -> Ghc a
-gtryAll [] = error "gtryAll: empty list"
-gtryAll [x] = x
+-- | Try each action in a list, mapping every exception to Nothing.
+gtryAll :: [Ghc a] -> Ghc (Maybe a)
+gtryAll [] = pure Nothing
 gtryAll (x:xs) =
   gtry x >>= \case
     Left (_ :: SomeException) -> gtryAll xs
-    Right y -> pure y
+    Right y -> pure (Just y)
